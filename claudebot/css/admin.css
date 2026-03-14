@@ -1,0 +1,114 @@
+#claudebot-settings {
+    max-width: 700px;
+}
+
+#claudebot-settings h3 {
+    margin-top: 24px;
+    margin-bottom: 8px;
+}
+
+.claudebot-add-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 12px;
+    align-items: flex-start;
+}
+
+.claudebot-ac-wrapper {
+    position: relative;
+    flex: 1;
+    max-width: 350px;
+}
+
+.claudebot-ac-wrapper input {
+    width: 100%;
+    box-sizing: border-box;
+}
+
+.claudebot-ac-dropdown {
+    display: none;
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    background: var(--color-main-background);
+    border: 1px solid var(--color-border);
+    border-top: none;
+    border-radius: 0 0 var(--border-radius) var(--border-radius);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+    z-index: 1000;
+    max-height: 250px;
+    overflow-y: auto;
+}
+
+.claudebot-ac-item {
+    padding: 8px 12px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.claudebot-ac-item:hover {
+    background: var(--color-background-hover);
+}
+
+.claudebot-ac-item.claudebot-ac-empty {
+    color: var(--color-text-maxcontrast);
+    font-style: italic;
+    cursor: default;
+}
+
+.claudebot-ac-icon {
+    flex-shrink: 0;
+    width: 20px;
+    text-align: center;
+}
+
+.claudebot-ac-label {
+    font-weight: 500;
+}
+
+.claudebot-ac-sub {
+    color: var(--color-text-maxcontrast);
+    font-size: 0.85em;
+    margin-left: 4px;
+}
+
+.claudebot-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 16px;
+}
+
+.claudebot-table th,
+.claudebot-table td {
+    padding: 8px 12px;
+    text-align: left;
+    border-bottom: 1px solid var(--color-border);
+}
+
+.claudebot-table th {
+    font-weight: 600;
+    color: var(--color-text-maxcontrast);
+    font-size: 0.9em;
+}
+
+.claudebot-table .claudebot-delete {
+    color: var(--color-error);
+    cursor: pointer;
+    border: none;
+    background: none;
+    padding: 4px 8px;
+    border-radius: var(--border-radius);
+}
+
+.claudebot-table .claudebot-delete:hover {
+    background: var(--color-error);
+    color: white;
+}
+
+.claudebot-table .claudebot-empty {
+    color: var(--color-text-maxcontrast);
+    font-style: italic;
+}

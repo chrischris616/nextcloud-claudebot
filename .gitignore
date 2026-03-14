@@ -1,0 +1,7 @@
+*.tar.gz
+*.key
+*.csr
+*.crt
+.idea/
+.vscode/
+node_modules/
