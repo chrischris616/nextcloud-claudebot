@@ -5,3 +5,6 @@
 .idea/
 .vscode/
 node_modules/
+bot/config.json
+__pycache__/
+*.pyc

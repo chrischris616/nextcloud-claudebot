@@ -1,0 +1,16 @@
+{
+  "nextcloud": {
+    "base_url": "https://your-nextcloud.example.com",
+    "username": "bot-claude",
+    "password": "your-app-password-here",
+    "notify_user": ""
+  },
+  "claude": {
+    "model": "sonnet",
+    "max_response_length": 3500,
+    "working_directory": "/home/your-user",
+    "max_turns": 0
+  },
+  "permission_cache_ttl": 300,
+  "admin_users": ["your-admin-username"]
+}

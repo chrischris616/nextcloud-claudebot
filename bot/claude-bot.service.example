@@ -1,0 +1,16 @@
+[Unit]
+Description=Claude Bot - Nextcloud Talk AI Assistant
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=your-user
+WorkingDirectory=/home/your-user
+ExecStart=/usr/bin/python3 /path/to/claude_bot.py
+Restart=on-failure
+RestartSec=10
+Environment=PATH=/usr/local/bin:/usr/bin:/home/your-user/.local/bin
+
+[Install]
+WantedBy=multi-user.target
