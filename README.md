@@ -13,11 +13,13 @@ User (Talk) → NC Talk API → Bot Service → Claude Code CLI
               Permission ← NC App API (check)
 ```
 
-1. Users send messages in Nextcloud Talk 1:1 conversations with the bot user
-2. The bot service polls for new messages via long-polling
+1. Users send messages (text, voice, or files) in any Nextcloud Talk conversation with the bot
+2. The bot service polls for new messages via long-polling (one thread per room)
 3. Before responding, it checks the permission API (provided by the NC app)
-4. If allowed, the message is forwarded to Claude Code CLI
-5. The response is sent back to the Talk conversation
+4. Voice messages are transcribed locally using faster-whisper (GPU accelerated)
+5. Files (images, PDFs, etc.) are downloaded and passed to Claude for analysis
+6. If allowed, the message is forwarded to Claude Code CLI
+7. The response is sent back to the Talk conversation
 
 ## Nextcloud App
 
@@ -58,6 +60,7 @@ The Python bot runs on any server with [Claude Code CLI](https://docs.anthropic.
 - Python 3.9+
 - Claude Code CLI (`claude`) installed and authenticated
 - Network access to your Nextcloud instance
+- **Optional:** faster-whisper + NVIDIA GPU for voice message transcription
 
 ### Setup
 
@@ -90,15 +93,27 @@ The Python bot runs on any server with [Claude Code CLI](https://docs.anthropic.
 
 ### Bot Commands
 
-Users can send these commands in their Talk conversation:
+Users can send these commands in any Talk conversation with the bot:
 
 | Command | Description |
 |---------|-------------|
 | `/clear` | Start a new Claude session |
 | `/stop` | Cancel a running request |
 | `/model [name]` | Show/change model (sonnet, opus, haiku) |
+| `/effort [level]` | Set response quality (low, medium, high, max) |
+| `/cost` | Show token usage and costs for current session |
+| `/compact [focus]` | Compress session context |
 | `/status` | Show session info |
 | `/help` | Show available commands |
+
+### Multi-Room Behavior
+
+- **1:1 chats:** Bot responds to all messages
+- **Groups with only bot + 1 user:** Bot responds to all messages
+- **Groups with multiple users:** Bot responds only to @mentions or /commands
+- **Voice messages:** Automatically transcribed and forwarded to Claude
+- **File attachments:** Downloaded and passed to Claude for analysis (images, PDFs, etc.)
+- **Message queue:** Messages sent while Claude is busy are queued and processed in order
 
 ### Running as a systemd Service
 

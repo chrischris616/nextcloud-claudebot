@@ -23,7 +23,7 @@ Control which users and groups are allowed to interact with a Claude AI bot via 
 
 The bot user can be configured via `occ config:app:set claudebot bot_user --value="your-bot-user"`.
     ]]></description>
-    <version>1.1.0</version>
+    <version>2.0.0</version>
     <licence>AGPL-3.0-or-later</licence>
     <author>Chris</author>
     <namespace>ClaudeBot</namespace>

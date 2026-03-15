@@ -71,11 +71,23 @@ class NextcloudTalkClient:
         return None
 
     def send_message(self, room_token, message):
-        """Send a message to a specific room. Returns True on success."""
+        """Send a message to a specific room. Returns message ID (int) on success, None on failure."""
         body = f'message={quote(message)}'
         result = self._request(
             'POST',
             f'/ocs/v2.php/apps/spreed/api/v1/chat/{room_token}',
+            body=body,
+        )
+        if result:
+            return result.get('ocs', {}).get('data', {}).get('id')
+        return None
+
+    def edit_message(self, room_token, message_id, new_message):
+        """Edit an existing message. Returns True on success."""
+        body = f'message={quote(new_message)}'
+        result = self._request(
+            'PUT',
+            f'/ocs/v2.php/apps/spreed/api/v1/chat/{room_token}/{message_id}',
             body=body,
         )
         return result is not None
@@ -222,6 +234,19 @@ class NextcloudTalkClient:
                 new_last_id = max_id
 
         return messages, new_last_id
+
+    def get_participant_count(self, token):
+        """Get the number of participants in a room.
+        Returns int count, or 2 as fallback on error.
+        """
+        result = self._request(
+            'GET',
+            f'/ocs/v2.php/apps/spreed/api/v4/room/{token}/participants',
+        )
+        if result:
+            participants = result.get('ocs', {}).get('data', [])
+            return len(participants)
+        return 2  # Safe fallback: assume bot + 1 user
 
     def init_last_known_id_for_room(self, token):
         """Get the latest message ID for a room so we only process NEW messages.

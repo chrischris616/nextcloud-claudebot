@@ -4,6 +4,34 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [2.0.0] - 2026-03-15
+
+### Added
+- **Multi-room support** — Bot works in 1:1 chats, group conversations, and public rooms
+- **Voice message support** — Transcribes audio messages using faster-whisper (GPU/CUDA)
+- **File attachment support** — Images, PDFs, text files are downloaded and passed to Claude for analysis
+- **Message queue** — Messages sent while Claude is busy are queued and processed sequentially
+- **Status message editing** — "Thinking..." messages are edited in-place instead of sending new ones
+- **`/effort [level]`** command — Control response quality (low, medium, high, max)
+- **`/cost`** command — Show token usage and costs for the current session
+- **`/compact [focus]`** command — Compress session context (summarize + restart with context)
+- **Cost tracking** — Tracks input/output tokens and USD cost per session via JSON output
+- **Mention detection** — In groups with multiple users, bot only responds to @mentions or /commands
+- **Participant count tracking** — Periodically updated for group response logic
+- **Whisper GPU auto-unload** — Model unloads from GPU after 5 minutes of inactivity
+
+### Changed
+- Sessions are now per (room, user) instead of per user
+- `send_message()` now returns the message ID (int) instead of boolean
+- Claude CLI called with `--output-format json` for cost tracking
+- Claude CLI called with `--effort` flag (configurable per session)
+- Status updates edit existing message instead of sending new ones
+- Room types 4 (changelog), 5 (notes), 6 (note-to-self) are skipped
+
+### Fixed
+- URL encoding for file downloads with spaces in filenames
+- Missing leading slash in WebDAV file paths
+
 ## [1.1.0] - 2026-03-14
 
 ### Changed
