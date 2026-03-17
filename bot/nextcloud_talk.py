@@ -82,6 +82,47 @@ class NextcloudTalkClient:
             return result.get('ocs', {}).get('data', {}).get('id')
         return None
 
+    def create_poll(self, room_token, question, options, max_votes=1):
+        """Create a poll in a room. Returns poll ID on success, None on failure.
+        Does not work in 1:1 conversations (NC Talk limitation).
+        Uses resultMode=1 so votes are immediately visible for monitoring.
+        """
+        from urllib.parse import urlencode
+        body = urlencode({
+            'question': question,
+            'options[]': options,
+            'resultMode': 1,
+            'maxVotes': max_votes,
+        }, doseq=True)
+        result = self._request(
+            'POST',
+            f'/ocs/v2.php/apps/spreed/api/v1/poll/{room_token}',
+            body=body,
+        )
+        if result:
+            return result.get('ocs', {}).get('data', {}).get('id')
+        return None
+
+    def get_poll(self, room_token, poll_id):
+        """Get poll results. Returns poll data dict or None."""
+        result = self._request(
+            'GET',
+            f'/ocs/v2.php/apps/spreed/api/v1/poll/{room_token}/{poll_id}',
+        )
+        if result:
+            return result.get('ocs', {}).get('data')
+        return None
+
+    def close_poll(self, room_token, poll_id):
+        """Close a poll. Returns poll data with final results or None."""
+        result = self._request(
+            'DELETE',
+            f'/ocs/v2.php/apps/spreed/api/v1/poll/{room_token}/{poll_id}',
+        )
+        if result:
+            return result.get('ocs', {}).get('data')
+        return None
+
     def edit_message(self, room_token, message_id, new_message):
         """Edit an existing message. Returns True on success."""
         body = f'message={quote(new_message)}'

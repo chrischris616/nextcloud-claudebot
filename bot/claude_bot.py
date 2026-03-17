@@ -103,6 +103,7 @@ class UserSession:
         self._worker_running = False
         self.status_msg_id = None  # ID of the current status message (for editing)
         self.status_room_token = None  # Room of the current status message
+        self.active_poll = None  # {poll_id, room_token, question, options} — active poll awaiting vote
         # Cost tracking
         self.total_cost = 0.0
         self.total_input_tokens = 0
@@ -179,6 +180,18 @@ class ClaudeBot:
         env.pop('CLAUDECODE', None)
         env.pop('CLAUDE_CODE_SESSION', None)
 
+        poll_instruction = (
+            'Wenn du dem User eine Rückfrage mit konkreten Auswahlmöglichkeiten stellen willst, '
+            'verwende dieses Format am ENDE deiner Antwort:\n'
+            '[POLL]\n'
+            'Frage: Deine Frage hier?\n'
+            'Option: Erste Option\n'
+            'Option: Zweite Option\n'
+            'Option: Dritte Option\n'
+            '[/POLL]\n'
+            'Nutze das nur bei echten Rückfragen mit 2-6 klaren Optionen, nicht bei offenen Fragen.'
+        )
+
         cmd = [
             'claude',
             '-p', message,
@@ -186,6 +199,7 @@ class ClaudeBot:
             '--effort', session.effort,
             '--output-format', 'json',
             '--dangerously-skip-permissions',
+            '--append-system-prompt', poll_instruction,
         ]
 
         if self.max_turns > 0:
@@ -276,6 +290,57 @@ class ClaudeBot:
             return 'Fehler: Claude CLI nicht gefunden. Ist claude installiert?'
         except Exception as e:
             return f'Fehler: {e}'
+
+    def _extract_poll(self, text):
+        """Extract [POLL]...[/POLL] block from Claude output.
+        Returns (text_without_poll, question, options) or (text, None, None) if no poll.
+        """
+        match = re.search(r'\[POLL\]\s*\n(.*?)\[/POLL\]', text, re.DOTALL)
+        if not match:
+            return text, None, None
+
+        poll_block = match.group(1)
+        text_without_poll = text[:match.start()].rstrip()
+
+        question = None
+        options = []
+        for line in poll_block.strip().split('\n'):
+            line = line.strip()
+            if line.lower().startswith('frage:'):
+                question = line[6:].strip()
+            elif line.lower().startswith('option:'):
+                opt = line[7:].strip()
+                if opt:
+                    options.append(opt)
+
+        if question and len(options) >= 2:
+            return text_without_poll, question, options
+        return text, None, None
+
+    def _send_poll_or_fallback(self, room_token, question, options, session):
+        """Try to create a NC Talk poll. Falls back to numbered list in 1:1 chats."""
+        room_state = self.rooms.get(room_token, {})
+        room_type = room_state.get('type', 1)
+
+        # Polls don't work in 1:1 chats
+        if room_type != 1:
+            poll_id = self.nc.create_poll(room_token, question, options)
+            if poll_id:
+                log.info(f'Created poll {poll_id} in {room_token}: {question}')
+                session.active_poll = {
+                    'poll_id': poll_id,
+                    'room_token': room_token,
+                    'question': question,
+                    'options': options,
+                }
+                return
+
+        # Fallback: numbered list
+        lines = [f'📊 {question}']
+        for i, opt in enumerate(options, 1):
+            lines.append(f'{i}. {opt}')
+        lines.append('\nAntworte mit der Nummer deiner Wahl.')
+        self.nc.send_message(room_token, '\n'.join(lines))
 
     def _truncate(self, text):
         if len(text) <= self.max_response_length:
@@ -591,8 +656,9 @@ class ClaudeBot:
 
         if queued:
             log.info(f'[{room_token}:{actor_id}] Queued (queue size: {session.queue.qsize()})')
-        else:
+        elif not session.status_msg_id:
             # Send immediate "thinking" feedback and track message ID for editing
+            # Skip if status_msg_id already set (e.g. from voice transcription)
             try:
                 msg_id = self.nc.send_message(room_token, '💭 Claude denkt nach...')
                 session.status_msg_id = msg_id
@@ -631,17 +697,29 @@ class ClaudeBot:
                 try:
                     response = self._call_claude(text, session, room_token)
                     if response is not None:
+                        # Check for poll in response
+                        response, poll_question, poll_options = self._extract_poll(response)
                         response = self._truncate(response)
                         log.info(f'[{room_token}:{actor_id}] Response: {len(response)} chars')
                         # Edit status message with the response, or send new if edit fails
                         sent = False
-                        if session.status_msg_id:
+                        if response.strip():
+                            if session.status_msg_id:
+                                try:
+                                    sent = self.nc.edit_message(session.status_room_token, session.status_msg_id, response)
+                                except Exception:
+                                    pass
+                            if not sent:
+                                self.nc.send_message(room_token, response)
+                        elif session.status_msg_id:
+                            # No text, only poll — delete status message by editing to minimal
                             try:
-                                sent = self.nc.edit_message(session.status_room_token, session.status_msg_id, response)
+                                self.nc.edit_message(session.status_room_token, session.status_msg_id, '...')
                             except Exception:
                                 pass
-                        if not sent:
-                            self.nc.send_message(room_token, response)
+                        # Create poll if detected
+                        if poll_question and poll_options:
+                            self._send_poll_or_fallback(room_token, poll_question, poll_options, session)
                 except Exception as e:
                     log.error(f'[{room_token}:{actor_id}] Claude worker error: {e}')
                     try:
@@ -670,6 +748,63 @@ class ClaudeBot:
                 log.debug(f'Cleaned up temp file: {f}')
             except Exception:
                 pass
+
+    def _check_polls_for_room(self, room_token):
+        """Check all sessions in this room for active polls with votes."""
+        for (rt, uid), session in list(self.sessions.items()):
+            if rt != room_token or not session.active_poll:
+                continue
+            poll = session.active_poll
+            if poll['room_token'] != room_token:
+                continue
+
+            try:
+                poll_data = self.nc.get_poll(room_token, poll['poll_id'])
+                if not poll_data or poll_data.get('numVoters', 0) == 0:
+                    continue
+
+                # Someone voted — close poll and get results
+                result_data = self.nc.close_poll(room_token, poll['poll_id'])
+                session.active_poll = None
+
+                if not result_data:
+                    continue
+
+                # Find who voted and what they chose
+                details = result_data.get('details', [])
+                if not details:
+                    # Fallback: use votes dict
+                    votes = result_data.get('votes', {})
+                    if votes:
+                        # Find option with most votes
+                        top_option_key = max(votes, key=votes.get)
+                        option_idx = int(top_option_key.replace('option-', ''))
+                        chosen = poll['options'][option_idx] if option_idx < len(poll['options']) else '?'
+                        voter_id = uid  # Assume session owner voted
+                    else:
+                        continue
+                else:
+                    # Use details for voter info
+                    voter = details[0]
+                    voter_id = voter.get('actorId', '')
+                    option_idx = voter.get('optionId', 0)
+                    chosen = poll['options'][option_idx] if option_idx < len(poll['options']) else '?'
+
+                # Permission check on voter
+                if not self.permissions.is_allowed(voter_id):
+                    log.info(f'Poll vote from unauthorized user {voter_id}, ignoring')
+                    continue
+
+                log.info(f'[{room_token}:{voter_id}] Poll answer: {chosen}')
+
+                # Forward the chosen option to Claude as a message
+                answer_text = f'[Umfrage-Antwort auf "{poll["question"]}"]: {chosen}'
+                response = self.handle_message(answer_text, voter_id, room_token)
+                if response:
+                    self.nc.send_message(room_token, response)
+
+            except Exception as e:
+                log.error(f'Poll check error in {room_token}: {e}')
 
     def _start_room_thread(self, token):
         """Start a long-poll thread for a room if not already running."""
@@ -804,17 +939,34 @@ class ClaudeBot:
 
                         log.info(f'[{token}:{actor_id}] File: {file_name} ({mimetype})')
                         try:
+                            # Send initial status for voice messages
+                            status_mid = None
+                            if is_voice:
+                                status_mid = self.nc.send_message(token, '🎤 Transkribiere Sprachnachricht...')
+
                             local_path = self._download_file(file_path)
                             if not local_path:
-                                self.nc.send_message(token, f'Datei konnte nicht heruntergeladen werden: {file_name}')
+                                if status_mid:
+                                    self.nc.edit_message(token, status_mid, f'Datei konnte nicht heruntergeladen werden: {file_name}')
+                                else:
+                                    self.nc.send_message(token, f'Datei konnte nicht heruntergeladen werden: {file_name}')
                                 continue
 
                             if is_voice:
                                 # Voice/audio → transcribe, then send text to Claude
                                 transcription = self._transcribe_audio(local_path)
                                 if not transcription:
-                                    self.nc.send_message(token, 'Sprachnachricht konnte nicht transkribiert werden.')
+                                    if status_mid:
+                                        self.nc.edit_message(token, status_mid, 'Sprachnachricht konnte nicht transkribiert werden.')
+                                    else:
+                                        self.nc.send_message(token, 'Sprachnachricht konnte nicht transkribiert werden.')
                                     continue
+                                # Pass transcription status message to session so handle_message
+                                # reuses it instead of creating a new "thinking" message
+                                if status_mid:
+                                    session = self._get_session(actor_id, token)
+                                    session.status_msg_id = status_mid
+                                    session.status_room_token = token
                                 prompt = f'[Sprachnachricht]: {transcription}'
                                 response = self.handle_message(prompt, actor_id, token)
                             else:
@@ -845,6 +997,9 @@ class ClaudeBot:
                             self.nc.send_message(token, response)
                     except Exception as e:
                         log.error(f'Error handling message from {actor_id} in {token}: {e}')
+
+                # Check active polls for votes in this room
+                self._check_polls_for_room(token)
 
             except Exception as e:
                 log.error(f'Poll error room {token}: {e}, retry in {backoff}s')
