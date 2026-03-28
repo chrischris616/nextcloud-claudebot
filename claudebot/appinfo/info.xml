@@ -3,27 +3,52 @@
       xsi:noNamespaceSchemaLocation="https://apps.nextcloud.com/schema/apps/info.xsd">
     <id>claudebot</id>
     <name>Claude Bot</name>
-    <summary>Permission management for a Claude AI assistant in Nextcloud Talk</summary>
-    <description><![CDATA[## Claude Bot Permission Manager
+    <summary>Chat with Claude AI in Nextcloud Talk — requires Claude Code CLI on your server</summary>
+    <description><![CDATA[## Claude Bot for Nextcloud Talk
 
-Control which users and groups are allowed to interact with a Claude AI bot via Nextcloud Talk.
+Chat with Anthropic's Claude AI directly in Nextcloud Talk. Send text, voice messages, or files — Claude responds right in the conversation.
+
+### What you need
+
+This app has **two parts** that work together:
+
+1. **This Nextcloud app** — manages permissions (who can use the bot)
+2. **A Python bot service** — runs on your server, connects Talk to Claude
+
+**Server requirements:**
+- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated (requires an Anthropic API key)
+- Python 3.9+ for the bot service
+- The bot service from the [GitHub repository](https://github.com/chrischris616/nextcloud-claudebot)
 
 ### Features
-- **User permissions** — Allow individual users to chat with the Claude bot
-- **Group permissions** — Allow entire groups at once
-- **Admin UI** — Manage permissions from Settings → Administration → Claude Bot
-- **REST API** — The bot queries the API to verify permissions before responding
-- **Autocomplete** — Search users and groups with Nextcloud's built-in autocomplete
+- **Text chat** — Ask Claude anything, get responses in Talk
+- **Voice messages** — Automatically transcribed and answered (optional, requires faster-whisper + GPU)
+- **File attachments** — Send images, PDFs, or documents for Claude to analyze
+- **Multi-room** — Works in 1:1 chats and group conversations
+- **Per-user sessions** — Each user has their own conversation context
+- **User & group permissions** — Control who can use the bot via admin UI
+- **Bot commands** — /model, /clear, /cost, /effort, /stop, /help
+
+### Setup
+
+1. Install this app on your Nextcloud instance
+2. Create a Nextcloud user for the bot (e.g. `bot-claude`)
+3. Add allowed users/groups in Settings → Administration → Claude Bot
+4. Clone the [bot service](https://github.com/chrischris616/nextcloud-claudebot) on your server
+5. Install Claude Code CLI and authenticate it
+6. Configure and start the bot service (see GitHub README for details)
 
 ### How it works
-1. Install this app on your Nextcloud instance
-2. Create a Nextcloud user for your bot (default: `bot-claude`)
-3. Set up your Claude bot service to call the permission check API
-4. Add allowed users/groups in the admin settings
+
+```
+User (Talk) → Bot Service → Claude Code CLI → Response back to Talk
+                  ↓
+          Permission check via this app's API
+```
 
 The bot user can be configured via `occ config:app:set claudebot bot_user --value="your-bot-user"`.
     ]]></description>
-    <version>2.0.0</version>
+    <version>2.1.0</version>
     <licence>AGPL-3.0-or-later</licence>
     <author>Chris</author>
     <namespace>ClaudeBot</namespace>
