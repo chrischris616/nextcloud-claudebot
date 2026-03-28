@@ -84,7 +84,7 @@
             var results = response.ocs ? response.ocs.data : [];
             $dropdown.empty();
             if (results.length === 0) {
-                $dropdown.append('<div class="claudebot-ac-item claudebot-ac-empty">No results</div>');
+                $dropdown.append('<div class="claudebot-ac-item claudebot-ac-empty">' + t('claudebot', 'No results') + '</div>');
             } else {
                 results.forEach(function(item) {
                     var $item = $('<div class="claudebot-ac-item">');
@@ -127,7 +127,7 @@
         var items = permissions.filter(function(p) { return p.type === type; });
 
         if (items.length === 0) {
-            $tbody.append('<tr><td colspan="4" class="claudebot-empty">No entries</td></tr>');
+            $tbody.append('<tr><td colspan="4" class="claudebot-empty">' + t('claudebot', 'No entries') + '</td></tr>');
             return;
         }
 
@@ -137,7 +137,7 @@
             $row.append($('<td>').text(icon + p.target));
             $row.append($('<td>').text(p.addedBy || '-'));
             $row.append($('<td>').text(formatDate(p.addedAt)));
-            var $btn = $('<button class="claudebot-delete">').text('Remove');
+            var $btn = $('<button class="claudebot-delete">').text(t('claudebot', 'Remove'));
             $btn.on('click', function() { deletePermission(p.id); });
             $row.append($('<td>').append($btn));
             $tbody.append($row);
@@ -157,22 +157,22 @@
             renderTable('#claudebot-group-table', data, 'group');
         }).fail(function(xhr) {
             console.error('[ClaudeBot] Failed to load permissions:', xhr.status, xhr.responseText);
-            OC.Notification.showTemporary('Failed to load permissions (HTTP ' + xhr.status + ')');
+            OC.Notification.showTemporary(t('claudebot', 'Failed to load permissions (HTTP {status})', { status: xhr.status }));
         });
     }
 
     function addPermission(type, target) {
         if (!target || !target.trim()) {
-            OC.Notification.showTemporary('Please enter a name');
+            OC.Notification.showTemporary(t('claudebot', 'Please enter a name'));
             return;
         }
         apiCall('POST', '/permissions', { type: type, target: target.trim() })
             .done(function() {
                 loadPermissions();
-                OC.Notification.showTemporary(type === 'user' ? 'User added' : 'Group added');
+                OC.Notification.showTemporary(type === 'user' ? t('claudebot', 'User added') : t('claudebot', 'Group added'));
             })
             .fail(function(xhr) {
-                var msg = 'Error';
+                var msg = t('claudebot', 'Error');
                 try { msg = xhr.responseJSON.ocs.data.message || msg; } catch(e) {}
                 OC.Notification.showTemporary(msg);
             });
@@ -180,23 +180,23 @@
 
     function deletePermission(id) {
         OC.dialogs.confirmDestructive(
-            'Really remove this permission?',
-            'Remove permission',
+            t('claudebot', 'Really remove this permission?'),
+            t('claudebot', 'Remove permission'),
             {
                 type: OC.dialogs.YES_NO_BUTTONS,
-                confirm: 'Remove',
+                confirm: t('claudebot', 'Remove'),
                 confirmClasses: 'error',
-                cancel: 'Cancel'
+                cancel: t('claudebot', 'Cancel')
             },
             function(confirmed) {
                 if (!confirmed) return;
                 apiCall('DELETE', '/permissions/' + id)
                     .done(function() {
                         loadPermissions();
-                        OC.Notification.showTemporary('Permission removed');
+                        OC.Notification.showTemporary(t('claudebot', 'Permission removed'));
                     })
                     .fail(function() {
-                        OC.Notification.showTemporary('Failed to remove permission');
+                        OC.Notification.showTemporary(t('claudebot', 'Failed to remove permission'));
                     });
             },
             true

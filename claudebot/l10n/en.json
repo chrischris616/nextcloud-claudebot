@@ -1,0 +1,30 @@
+{
+    "translations": {
+        "Claude Bot": "Claude Bot",
+        "Claude Bot — Permissions": "Claude Bot — Permissions",
+        "Manage which users and groups are allowed to interact with the Claude Talk Bot.": "Manage which users and groups are allowed to interact with the Claude Talk Bot.",
+        "Allowed Users": "Allowed Users",
+        "Search user...": "Search user...",
+        "Add": "Add",
+        "User": "User",
+        "Added by": "Added by",
+        "Date": "Date",
+        "Allowed Groups": "Allowed Groups",
+        "Search group...": "Search group...",
+        "Group": "Group",
+        "No results": "No results",
+        "No entries": "No entries",
+        "Remove": "Remove",
+        "Failed to load permissions (HTTP {status})": "Failed to load permissions (HTTP {status})",
+        "Please enter a name": "Please enter a name",
+        "User added": "User added",
+        "Group added": "Group added",
+        "Error": "Error",
+        "Really remove this permission?": "Really remove this permission?",
+        "Remove permission": "Remove permission",
+        "Cancel": "Cancel",
+        "Permission removed": "Permission removed",
+        "Failed to remove permission": "Failed to remove permission"
+    },
+    "plurals": {}
+}

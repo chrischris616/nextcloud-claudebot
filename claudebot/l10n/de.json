@@ -1,0 +1,30 @@
+{
+    "translations": {
+        "Claude Bot": "Claude Bot",
+        "Claude Bot — Permissions": "Claude Bot — Berechtigungen",
+        "Manage which users and groups are allowed to interact with the Claude Talk Bot.": "Verwalte, welche Benutzer und Gruppen mit dem Claude Talk Bot interagieren dürfen.",
+        "Allowed Users": "Berechtigte Benutzer",
+        "Search user...": "Benutzer suchen…",
+        "Add": "Hinzufügen",
+        "User": "Benutzer",
+        "Added by": "Hinzugefügt von",
+        "Date": "Datum",
+        "Allowed Groups": "Berechtigte Gruppen",
+        "Search group...": "Gruppe suchen…",
+        "Group": "Gruppe",
+        "No results": "Keine Ergebnisse",
+        "No entries": "Keine Einträge",
+        "Remove": "Entfernen",
+        "Failed to load permissions (HTTP {status})": "Berechtigungen konnten nicht geladen werden (HTTP {status})",
+        "Please enter a name": "Bitte einen Namen eingeben",
+        "User added": "Benutzer hinzugefügt",
+        "Group added": "Gruppe hinzugefügt",
+        "Error": "Fehler",
+        "Really remove this permission?": "Diese Berechtigung wirklich entfernen?",
+        "Remove permission": "Berechtigung entfernen",
+        "Cancel": "Abbrechen",
+        "Permission removed": "Berechtigung entfernt",
+        "Failed to remove permission": "Berechtigung konnte nicht entfernt werden"
+    },
+    "plurals": {}
+}
