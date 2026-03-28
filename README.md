@@ -151,7 +151,7 @@ DELETE /ocs/v2.php/apps/claudebot/api/v1/permissions/{id}
 
 ## Screenshots
 
-![Admin UI](screenshots/admin-ui.png)
+![Admin UI](screenshots/admin-ui.png?v=2)
 
 ## License
 
