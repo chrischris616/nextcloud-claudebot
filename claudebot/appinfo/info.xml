@@ -8,20 +8,23 @@
 
 Chat with Anthropic's Claude AI directly in Nextcloud Talk. Send text, voice messages, or files — Claude responds right in the conversation.
 
-### What you need
+### Important: This app alone is only the permission manager!
 
-This app has **two parts** that work together:
+This Nextcloud app manages **who is allowed** to use the bot. To actually chat with Claude, you also need to run the **Python bot service** with **Claude Code CLI** on a separate machine. Without the bot service, this app does nothing on its own.
 
-1. **This Nextcloud app** — install on your Nextcloud to manage permissions (who can use the bot)
-2. **A Python bot service** — runs on any machine with network access to your Nextcloud (does not have to be the same server!)
+### What you need (two parts)
 
-**Bot service requirements (any machine):**
+1. **This Nextcloud app** (install on your Nextcloud) — Permission manager: controls which users and groups are allowed to interact with the bot
+2. **Python bot service + Claude Code CLI** (run on any machine) — The actual bot: connects Nextcloud Talk to Claude AI, processes messages and sends responses
+
+**Bot service requirements (runs on any machine):**
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated (requires an Anthropic API key)
 - Python 3.9+
+- A dedicated Nextcloud user for the bot (e.g. `bot-claude`)
 - Network access to your Nextcloud instance (HTTPS)
 - The bot service from the [GitHub repository](https://github.com/chrischris616/nextcloud-claudebot)
 
-The bot service just needs to reach your Nextcloud via HTTPS — it can run on a laptop, a VPS, a Raspberry Pi, or anywhere else.
+The bot service just needs to reach your Nextcloud via HTTPS — it can run on a laptop, a VPS, a Raspberry Pi, or anywhere else. It logs in as the bot user and polls Nextcloud Talk for new messages.
 
 ### Features
 - **Text chat** — Ask Claude anything, get responses in Talk
@@ -51,7 +54,7 @@ User (Talk) → Bot Service → Claude Code CLI → Response back to Talk
 
 The bot user can be configured via `occ config:app:set claudebot bot_user --value="your-bot-user"`.
     ]]></description>
-    <version>2.1.1</version>
+    <version>2.1.2</version>
     <licence>AGPL-3.0-or-later</licence>
     <author>Chris</author>
     <namespace>ClaudeBot</namespace>
