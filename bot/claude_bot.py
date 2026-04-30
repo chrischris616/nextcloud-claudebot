@@ -23,7 +23,7 @@ import threading
 import tempfile
 import queue
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -103,7 +103,9 @@ class UserSession:
         self._worker_running = False
         self.status_msg_id = None  # ID of the current status message (for editing)
         self.status_room_token = None  # Room of the current status message
+        self.status_send_failed = False  # True after a status send_message returned None — don't retry
         self.active_poll = None  # {poll_id, room_token, question, options} — active poll awaiting vote
+        self.transcribe_pending = False  # /transcribe: next voice → .txt instead of Claude
         # Cost tracking
         self.total_cost = 0.0
         self.total_input_tokens = 0
@@ -161,6 +163,13 @@ class ClaudeBot:
         self._whisper_unload_delay = 300  # 5 min inactivity → unload from GPU
         self._whisper_lock = threading.Lock()
 
+        # Persistent usage log: one JSON line per Claude CLI call
+        self.usage_log_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 'data', 'usage.jsonl'
+        )
+        os.makedirs(os.path.dirname(self.usage_log_path), exist_ok=True)
+        self._usage_log_lock = threading.Lock()
+
         log.info(f'Multi-user mode. Default model: {self.default_model}')
 
     def _get_session(self, user_id, room_token):
@@ -171,10 +180,57 @@ class ClaudeBot:
             log.info(f'New session for {user_id} in room {room_token}: {self.sessions[key].session_id[:8]}...')
         return self.sessions[key]
 
-    def _call_claude(self, message, session, room_token=None):
+    # Tool name to user-friendly status mapping
+    TOOL_STATUS = {
+        'Read': ('📖', 'Liest'),
+        'Write': ('📝', 'Schreibt'),
+        'Edit': ('✏️', 'Bearbeitet'),
+        'Bash': ('💻', 'Fuehrt aus'),
+        'Glob': ('🔍', 'Sucht Dateien'),
+        'Grep': ('🔍', 'Durchsucht Code'),
+        'Agent': ('🤖', 'Sub-Agent'),
+        'WebFetch': ('🌐', 'Ruft Webseite ab'),
+        'WebSearch': ('🌐', 'Sucht im Web'),
+        'Skill': ('⚡', 'Fuehrt Skill aus'),
+        'NotebookEdit': ('📓', 'Bearbeitet Notebook'),
+    }
+
+    @staticmethod
+    def _tool_detail(name, tool_input):
+        """Extract a short detail string from tool input for status display."""
+        if not isinstance(tool_input, dict):
+            return ''
+        if name in ('Read', 'Write', 'Edit'):
+            fp = tool_input.get('file_path', '')
+            if fp:
+                # Show last 2 path components
+                parts = fp.rstrip('/').split('/')
+                return '/'.join(parts[-2:]) if len(parts) >= 2 else parts[-1]
+        elif name == 'Bash':
+            cmd = tool_input.get('command', '')
+            # First line, max 50 chars
+            first_line = cmd.split('\n')[0][:50]
+            return first_line + ('...' if len(cmd) > 50 else '')
+        elif name in ('Grep', 'Glob'):
+            return tool_input.get('pattern', '')[:40]
+        elif name == 'WebSearch':
+            return tool_input.get('query', '')[:40]
+        elif name == 'WebFetch':
+            url = tool_input.get('url', '')
+            # Show domain only
+            if '://' in url:
+                url = url.split('://')[1].split('/')[0]
+            return url[:40]
+        elif name == 'Skill':
+            return tool_input.get('skill', '')
+        elif name == 'Agent':
+            return tool_input.get('description', '')[:40]
+        return ''
+
+    def _call_claude(self, message, session, room_token=None, is_voice=False):
         """Call Claude Code CLI with the given message using user's session.
-        Uses Popen with no timeout — runs until finished or killed via /stop.
-        Sends periodic status updates to keep user informed.
+        Uses Popen with stream-json output for live tool status updates.
+        Runs until finished or killed via /stop.
         """
         env = os.environ.copy()
         env.pop('CLAUDECODE', None)
@@ -192,14 +248,26 @@ class ClaudeBot:
             'Nutze das nur bei echten Rückfragen mit 2-6 klaren Optionen, nicht bei offenen Fragen.'
         )
 
+        voice_instruction = (
+            'Diese Anfrage kam als Sprachnachricht. '
+            'Antworte ausschließlich in natürlichem, fließendem gesprochenem Deutsch — '
+            'kein Markdown, keine Bullet-Points, keine Überschriften, keine Code-Blöcke, keine Listen. '
+            'Schreib so, wie du sprechen würdest.'
+        )
+
+        system_prompt = poll_instruction
+        if is_voice:
+            system_prompt = voice_instruction + '\n\n' + poll_instruction
+
         cmd = [
             'claude',
             '-p', message,
             '--model', session.model,
             '--effort', session.effort,
-            '--output-format', 'json',
+            '--output-format', 'stream-json',
+            '--verbose',
             '--dangerously-skip-permissions',
-            '--append-system-prompt', poll_instruction,
+            '--append-system-prompt', system_prompt,
         ]
 
         if self.max_turns > 0:
@@ -223,59 +291,140 @@ class ClaudeBot:
             )
             session.process = proc
 
-            start_time = time.time()
-            update_interval = 60  # Send status update every 60s
-            next_update = start_time + update_interval
-            update_count = 0
-            status_msgs = ['⏳ Claude arbeitet noch...', '🔧 Dauert etwas länger...', '⚙️ Immer noch dran...']
-
-            while True:
+            # Read stdout lines in a background thread to avoid pipe buffer deadlock
+            stdout_lines = []
+            def _read_stdout():
                 try:
-                    proc.wait(timeout=5)
-                    break  # Process finished
-                except subprocess.TimeoutExpired:
-                    # Periodic status update — edit existing status message
-                    if time.time() >= next_update and room_token:
-                        elapsed = time.time() - start_time
-                        msg = status_msgs[min(update_count, len(status_msgs) - 1)]
-                        elapsed_min = int(elapsed / 60)
-                        status_text = f'{msg} ({elapsed_min} Min)'
+                    for line in proc.stdout:
+                        stdout_lines.append(line.rstrip('\n'))
+                except Exception:
+                    pass
+            reader_thread = threading.Thread(target=_read_stdout, daemon=True)
+            reader_thread.start()
+
+            start_time = time.time()
+            last_status_update = 0
+            min_status_interval = 5  # Minimum seconds between status edits
+            lines_seen = 0
+            tool_count = 0
+            tool_history = []  # List of emojis for completed tools
+            current_tool_text = None  # Currently active tool display text
+            prev_tool_emoji = None  # Emoji of the previous tool (moves to history)
+
+            while proc.poll() is None:
+                time.sleep(2)
+
+                # Parse new stdout lines for tool_use events
+                new_lines = stdout_lines[lines_seen:]
+                lines_seen = len(stdout_lines)
+
+                for line in new_lines:
+                    try:
+                        event = json.loads(line)
+                        etype = event.get('type', '')
+
+                        # Look for tool_use in assistant content blocks
+                        if etype == 'assistant':
+                            content = event.get('message', {}).get('content', [])
+                            for block in content:
+                                if block.get('type') == 'tool_use':
+                                    tool_name = block.get('name', '')
+                                    tool_input = block.get('input', {})
+                                    emoji, label = self.TOOL_STATUS.get(tool_name, ('🔧', tool_name))
+                                    detail = self._tool_detail(tool_name, tool_input)
+                                    # Move previous tool to history
+                                    if prev_tool_emoji is not None:
+                                        tool_history.append(prev_tool_emoji)
+                                    prev_tool_emoji = emoji
+                                    current_tool_text = f'{emoji} {label}'
+                                    if detail:
+                                        current_tool_text += f': {detail}'
+                                    tool_count += 1
+                    except (json.JSONDecodeError, TypeError, KeyError):
+                        pass
+
+                # Update status message — always edit the existing status message
+                now = time.time()
+                elapsed = now - start_time
+
+                if room_token and (now - last_status_update) >= min_status_interval:
+                    # Build status: header line + current tool + history
+                    elapsed_str = f'{int(elapsed)}s' if elapsed < 60 else f'{int(elapsed / 60)} Min'
+
+                    if current_tool_text:
+                        # Show: tool count | elapsed | current tool | history trail
+                        history_str = ' '.join(tool_history[-15:]) if tool_history else ''
+                        lines = [f'⚙️ Tool {tool_count} | {elapsed_str}']
+                        lines.append(current_tool_text)
+                        if history_str:
+                            lines.append(history_str)
+                        status_text = '\n'.join(lines)
+                    elif elapsed >= 10:
+                        status_text = f'💭 Claude denkt nach... ({elapsed_str})'
+                    else:
+                        status_text = None
+
+                    if status_text:
                         try:
                             if session.status_msg_id:
                                 self.nc.edit_message(session.status_room_token, session.status_msg_id, status_text)
-                            else:
+                            elif not session.status_send_failed:
                                 mid = self.nc.send_message(room_token, status_text)
-                                session.status_msg_id = mid
-                                session.status_room_token = room_token
+                                if mid:
+                                    session.status_msg_id = mid
+                                    session.status_room_token = room_token
+                                else:
+                                    session.status_send_failed = True
                         except Exception:
                             pass
-                        update_count += 1
-                        next_update = time.time() + update_interval
+                        last_status_update = now
 
+            # Process finished — wait for reader thread
+            reader_thread.join(timeout=5)
             session.process = None
 
             # Check if killed by /stop
             if proc.returncode and proc.returncode < 0:
                 return None  # Signal kill — no response needed, /stop already sent message
 
-            raw_output = proc.stdout.read().strip()
             stderr = proc.stderr.read().strip()
 
-            # Parse JSON output for cost tracking and result text
-            output = raw_output
-            try:
-                result_json = json.loads(raw_output)
-                output = result_json.get('result', raw_output)
-                # Track costs
-                cost = result_json.get('total_cost_usd', 0)
-                if cost:
-                    session.total_cost += cost
-                usage = result_json.get('usage', {})
-                session.total_input_tokens += usage.get('input_tokens', 0) + usage.get('cache_read_input_tokens', 0) + usage.get('cache_creation_input_tokens', 0)
-                session.total_output_tokens += usage.get('output_tokens', 0)
-                log.info(f'Cost: ${cost:.4f} (session total: ${session.total_cost:.4f})')
-            except (json.JSONDecodeError, TypeError):
-                pass  # Fallback to raw output
+            # Parse stream-json output: find the result event
+            output = None
+            for line in reversed(stdout_lines):
+                try:
+                    event = json.loads(line)
+                    if event.get('type') == 'result':
+                        output = event.get('result', '')
+                        # Track costs
+                        cost = event.get('total_cost_usd', 0)
+                        if cost:
+                            session.total_cost += cost
+                        usage = event.get('usage', {})
+                        session.total_input_tokens += usage.get('input_tokens', 0) + usage.get('cache_read_input_tokens', 0) + usage.get('cache_creation_input_tokens', 0)
+                        session.total_output_tokens += usage.get('output_tokens', 0)
+                        log.info(f'Cost: ${cost:.4f} (session total: ${session.total_cost:.4f}), tools used: {tool_count}')
+                        self._log_usage(session, room_token, cost, usage, tool_count, time.time() - start_time)
+                        break
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            # Fallback: join all non-JSON lines as raw output
+            if output is None:
+                raw = '\n'.join(stdout_lines).strip()
+                # Try parsing as single JSON (old format fallback)
+                try:
+                    result_json = json.loads(raw)
+                    output = result_json.get('result', raw)
+                    cost = result_json.get('total_cost_usd', 0)
+                    if cost:
+                        session.total_cost += cost
+                    usage = result_json.get('usage', {})
+                    session.total_input_tokens += usage.get('input_tokens', 0) + usage.get('cache_read_input_tokens', 0) + usage.get('cache_creation_input_tokens', 0)
+                    session.total_output_tokens += usage.get('output_tokens', 0)
+                    self._log_usage(session, room_token, cost, usage, tool_count, time.time() - start_time)
+                except (json.JSONDecodeError, TypeError):
+                    output = raw
 
             if not output and stderr:
                 output = f'Fehler: {stderr}'
@@ -290,6 +439,46 @@ class ClaudeBot:
             return 'Fehler: Claude CLI nicht gefunden. Ist claude installiert?'
         except Exception as e:
             return f'Fehler: {e}'
+
+    def _log_usage(self, session, room_token, cost, usage, tool_count, duration_s):
+        """Append one Claude CLI call's metrics to the persistent usage log (JSONL).
+        One line per call so /usage can replay any time window without parsing logs.
+        """
+        try:
+            room_state = self.rooms.get(room_token, {}) if room_token else {}
+            now = datetime.now()
+            entry = {
+                'ts': now.isoformat(timespec='seconds'),
+                'date': now.strftime('%Y-%m-%d'),
+                'user': session.user_id,
+                'room': room_token or '',
+                'room_name': room_state.get('name', ''),
+                'model': session.model,
+                'effort': session.effort,
+                'input_tokens': int(usage.get('input_tokens', 0) or 0),
+                'output_tokens': int(usage.get('output_tokens', 0) or 0),
+                'cache_read': int(usage.get('cache_read_input_tokens', 0) or 0),
+                'cache_creation': int(usage.get('cache_creation_input_tokens', 0) or 0),
+                'cost_usd': round(float(cost or 0), 6),
+                'tools': int(tool_count or 0),
+                'duration_s': round(float(duration_s or 0), 2),
+            }
+            line = json.dumps(entry, ensure_ascii=False) + '\n'
+            with self._usage_log_lock:
+                with open(self.usage_log_path, 'a', encoding='utf-8') as f:
+                    f.write(line)
+        except Exception as e:
+            log.warning(f'Failed to log usage: {e}')
+
+    @staticmethod
+    def _fmt_num(n):
+        """Compact number formatting for token counts."""
+        n = int(n or 0)
+        if n >= 1_000_000:
+            return f'{n / 1_000_000:.2f}M'
+        if n >= 1_000:
+            return f'{n / 1_000:.1f}k'
+        return str(n)
 
     def _extract_poll(self, text):
         """Extract [POLL]...[/POLL] block from Claude output.
@@ -379,6 +568,55 @@ class ClaudeBot:
             log.error(f'File download error: {e}')
             return None
 
+    def _send_voice_message(self, text: str, token: str) -> bool:
+        """Generate TTS audio and send it as a voice message to the NC Talk room.
+        Returns True on success."""
+        try:
+            import asyncio, edge_tts, requests as req
+            # Generate MP3 with edge-tts
+            fname = f'claude_voice_{uuid.uuid4().hex[:8]}.mp3'
+            tmp_mp3 = Path(tempfile.gettempdir()) / fname
+            async def _tts():
+                tts = edge_tts.Communicate(text, voice='de-DE-FlorianMultilingualNeural')
+                await tts.save(str(tmp_mp3))
+            asyncio.run(_tts())
+            if not tmp_mp3.exists():
+                log.error('TTS: keine Ausgabedatei')
+                return False
+            audio_data = tmp_mp3.read_bytes()
+            log.info(f'TTS: {len(audio_data)} bytes generiert ({fname})')
+
+            # Upload to WebDAV /Talk/
+            base = f'https://{self.nc.host}'
+            dav_path = f'/remote.php/dav/files/{self.nc.username}/Talk/{fname}'
+            r = req.put(f'{base}{dav_path}', data=audio_data,
+                auth=(self.nc.username, self.nc.password),
+                headers={'Content-Type': 'audio/mpeg'}, timeout=30)
+            if r.status_code not in (200, 201, 204):
+                log.error(f'TTS upload failed: HTTP {r.status_code}')
+                return False
+
+            # Share as voice-message to Talk room
+            r2 = req.post(f'{base}/ocs/v2.php/apps/files_sharing/api/v1/shares',
+                auth=(self.nc.username, self.nc.password),
+                headers={'OCS-APIREQUEST': 'true', 'Accept': 'application/json'},
+                json={
+                    'shareType': 10,
+                    'path': f'/Talk/{fname}',
+                    'shareWith': token,
+                    'talkMetaData': json.dumps({'messageType': 'voice-message'}),
+                }, timeout=15)
+            if r2.status_code in (200, 201):
+                log.info(f'TTS voice message sent to room {token}')
+                tmp_mp3.unlink(missing_ok=True)
+                return True
+            else:
+                log.error(f'TTS share failed: HTTP {r2.status_code} {r2.text[:100]}')
+                return False
+        except Exception as e:
+            log.error(f'TTS error: {e}')
+            return False
+
     def _get_whisper_model(self):
         """Get or lazy-load the Whisper model. Thread-safe."""
         with self._whisper_lock:
@@ -412,8 +650,9 @@ class ClaudeBot:
         thread = threading.Thread(target=_check_unload, daemon=True)
         thread.start()
 
-    def _transcribe_audio(self, audio_path):
-        """Transcribe an audio file using faster-whisper. Returns transcribed text or None."""
+    def _transcribe_audio(self, audio_path, delete_after=True):
+        """Transcribe an audio file using faster-whisper. Returns transcribed text or None.
+        Deletes the source file after transcription unless delete_after=False."""
         try:
             model = self._get_whisper_model()
             segments, info = model.transcribe(audio_path, language='de')
@@ -425,24 +664,75 @@ class ClaudeBot:
             log.error(f'Transcription error: {e}')
             return None
         finally:
-            try:
-                os.unlink(audio_path)
-            except Exception:
-                pass
+            if delete_after:
+                try:
+                    os.unlink(audio_path)
+                except Exception:
+                    pass
+
+    def _send_transcript_file(self, text: str, token: str, source_name: str = '') -> bool:
+        """Upload transcript as .txt to NC /Talk/ and share to the room.
+        Returns True on success."""
+        try:
+            import requests as req
+            stem = Path(source_name).stem if source_name else 'transcript'
+            stem = re.sub(r'[^A-Za-z0-9_.-]+', '_', stem)[:60] or 'transcript'
+            fname = f'{stem}_{uuid.uuid4().hex[:6]}.txt'
+            base = f'https://{self.nc.host}'
+            dav_path = f'/remote.php/dav/files/{self.nc.username}/Talk/{fname}'
+            r = req.put(f'{base}{dav_path}', data=text.encode('utf-8'),
+                auth=(self.nc.username, self.nc.password),
+                headers={'Content-Type': 'text/plain; charset=utf-8'}, timeout=30)
+            if r.status_code not in (200, 201, 204):
+                log.error(f'Transcript upload failed: HTTP {r.status_code}')
+                return False
+            r2 = req.post(f'{base}/ocs/v2.php/apps/files_sharing/api/v1/shares',
+                auth=(self.nc.username, self.nc.password),
+                headers={'OCS-APIREQUEST': 'true', 'Accept': 'application/json'},
+                json={
+                    'shareType': 10,
+                    'path': f'/Talk/{fname}',
+                    'shareWith': token,
+                }, timeout=15)
+            if r2.status_code in (200, 201):
+                log.info(f'Transcript shared to room {token}: {fname}')
+                return True
+            log.error(f'Transcript share failed: HTTP {r2.status_code} {r2.text[:100]}')
+            return False
+        except Exception as e:
+            log.error(f'Transcript send error: {e}')
+            return False
+
+    def cmd_transcribe(self, session):
+        session.transcribe_pending = True
+        return ('🎤 Transkribier-Modus aktiv. Sende jetzt eine Sprachnachricht — '
+                'sie wird ohne Claude-Call als .txt im Chat geteilt.')
 
     def cmd_clear(self, session):
         old_id = session.reset()
         return f'Session zurueckgesetzt.\nAlte Session: {old_id}...\nNeue Session: {session.session_id[:8]}...'
 
     def cmd_model(self, session, args):
-        valid_models = ['sonnet', 'opus', 'haiku']
+        valid_models = ['sonnet', 'opus', 'opus4', 'opus47', 'haiku']
+        model_aliases = {
+            'opus4': 'claude-opus-4-6',
+            'opus47': 'claude-opus-4-7',
+        }
+        model_display = {
+            'sonnet': 'Sonnet 4.6 (Standard)',
+            'opus': 'Opus (Standard)',
+            'opus4': 'Opus 4.6 (claude-opus-4-6)',
+            'opus47': 'Opus 4.7 (claude-opus-4-7, neu!)',
+            'haiku': 'Haiku 4.5 (schnell/guenstig)',
+        }
         if not args:
-            return f'Dein Modell: {session.model}\nVerfuegbar: {", ".join(valid_models)}'
+            display = '\n'.join(f'  {k}: {v}' for k, v in model_display.items())
+            return f'Dein Modell: {session.model}\nVerfuegbar:\n{display}'
         new_model = args[0].lower()
         if new_model not in valid_models:
             return f'Unbekanntes Modell: {new_model}\nVerfuegbar: {", ".join(valid_models)}'
         old_model = session.model
-        session.model = new_model
+        session.model = model_aliases.get(new_model, new_model)
         return f'Modell gewechselt: {old_model} -> {session.model}'
 
     def cmd_status(self, session, user_id, room_token=None):
@@ -488,6 +778,20 @@ class ClaudeBot:
 
         return '\n'.join(lines)
 
+    def cmd_cancel(self, session):
+        """Clear the message queue (remove waiting messages, keep current running)."""
+        cleared = 0
+        while not session.queue.empty():
+            try:
+                _text, _room, temp_files, _is_voice = session.queue.get_nowait()
+                self._cleanup_temp_files(temp_files)
+                cleared += 1
+            except queue.Empty:
+                break
+        if cleared == 0:
+            return 'Keine wartenden Nachrichten in der Warteschlange.'
+        return f'🗑️ {cleared} wartende Nachricht{"en" if cleared != 1 else ""} aus der Warteschlange entfernt.'
+
     def cmd_stop(self, session):
         """Kill the running Claude CLI process and all its children."""
         if not session.busy or not session.process:
@@ -531,6 +835,157 @@ class ClaudeBot:
         if session.message_count > 0:
             avg = session.total_cost / session.message_count
             lines.append(f'Durchschnitt/Nachricht: ${avg:.4f}')
+        return '\n'.join(lines)
+
+    def cmd_usage(self, args, user_id):
+        """Show token usage from the persistent log. Args:
+        - none / 'heute' / 'today' → today
+        - 'gestern' / 'yesterday' → yesterday
+        - 'Nd' (e.g. '7d', '30d') → last N days
+        - 'YYYY-MM-DD' → specific date
+        - 'all' / 'alle' → entire history
+        - 'me' / 'mir' → restrict to caller; otherwise admins see global
+        """
+        args_lower = [a.lower() for a in args]
+        only_me = 'me' in args_lower or 'mir' in args_lower
+        range_arg = next((a for a in args_lower if a not in ('me', 'mir')), None)
+
+        today = datetime.now().date()
+        date_filter = None
+        title = ''
+
+        if range_arg is None or range_arg in ('today', 'heute'):
+            d = today.isoformat()
+            date_filter = lambda x: x == d
+            title = f'heute ({today.strftime("%d.%m.%Y")})'
+        elif range_arg in ('gestern', 'yesterday'):
+            yest = today - timedelta(days=1)
+            ds = yest.isoformat()
+            date_filter = lambda x: x == ds
+            title = f'gestern ({yest.strftime("%d.%m.%Y")})'
+        elif range_arg in ('all', 'alle', 'gesamt'):
+            date_filter = lambda x: True
+            title = 'gesamt'
+        elif range_arg.endswith('d') and range_arg[:-1].isdigit():
+            n = max(1, int(range_arg[:-1]))
+            cutoff = (today - timedelta(days=n - 1)).isoformat()
+            date_filter = lambda x: x >= cutoff
+            title = f'letzte {n} Tage'
+        elif re.match(r'^\d{4}-\d{2}-\d{2}$', range_arg):
+            ds = range_arg
+            date_filter = lambda x: x == ds
+            try:
+                title = datetime.strptime(ds, '%Y-%m-%d').strftime('%d.%m.%Y')
+            except ValueError:
+                title = ds
+        else:
+            return (
+                'Token-Verbrauch anzeigen. Beispiele:\n'
+                '/usage          (heute)\n'
+                '/usage gestern\n'
+                '/usage 7d       (letzte 7 Tage)\n'
+                '/usage 30d\n'
+                '/usage 2026-04-30\n'
+                '/usage all      (alle Daten)\n\n'
+                'Suffix "me" filtert auf eigene Calls, z.B. /usage 7d me'
+            )
+
+        if not os.path.exists(self.usage_log_path):
+            return f'📊 Keine Nutzungsdaten ({title}).'
+
+        is_admin = user_id in self.admin_users
+        # Non-admins always see only their own entries (privacy)
+        restrict_to_self = only_me or not is_admin
+
+        entries = []
+        try:
+            with open(self.usage_log_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        e = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not date_filter(e.get('date', '')):
+                        continue
+                    if restrict_to_self and e.get('user') != user_id:
+                        continue
+                    entries.append(e)
+        except Exception as ex:
+            return f'Fehler beim Lesen des Logs: {ex}'
+
+        if restrict_to_self and is_admin and only_me:
+            title += ' (eigene)'
+        elif restrict_to_self and not is_admin:
+            pass  # implicit self-scope, no annotation needed
+
+        if not entries:
+            return f'📊 Keine Nutzungsdaten ({title}).'
+
+        total_calls = len(entries)
+        total_cost = sum(e.get('cost_usd', 0) for e in entries)
+        total_in_new = sum(e.get('input_tokens', 0) for e in entries)
+        total_out = sum(e.get('output_tokens', 0) for e in entries)
+        total_cache_read = sum(e.get('cache_read', 0) for e in entries)
+        total_cache_creation = sum(e.get('cache_creation', 0) for e in entries)
+        total_tools = sum(e.get('tools', 0) for e in entries)
+        total_in_full = total_in_new + total_cache_read + total_cache_creation
+        cache_hit_pct = (total_cache_read / total_in_full * 100) if total_in_full > 0 else 0
+
+        lines = [f'📊 Token-Verbrauch — {title}']
+        lines.append(f'{total_calls} Calls   ${total_cost:.4f}   {total_tools} Tools')
+        lines.append(f'Tokens: {self._fmt_num(total_in_full)} in / {self._fmt_num(total_out)} out')
+        if total_in_full > 0:
+            lines.append(f'Cache: {cache_hit_pct:.0f}% hit ({self._fmt_num(total_cache_read)} cached, {self._fmt_num(total_in_new)} fresh)')
+
+        # Per-day breakdown when range > 1 day
+        distinct_dates = sorted({e.get('date', '') for e in entries})
+        if len(distinct_dates) > 1:
+            lines.append('')
+            lines.append('Pro Tag:')
+            per_day = {}
+            for e in entries:
+                d = e.get('date', '')
+                slot = per_day.setdefault(d, {'calls': 0, 'cost': 0.0})
+                slot['calls'] += 1
+                slot['cost'] += e.get('cost_usd', 0)
+            for d in distinct_dates:
+                try:
+                    day_str = datetime.strptime(d, '%Y-%m-%d').strftime('%a %d.%m')
+                except ValueError:
+                    day_str = d
+                v = per_day[d]
+                lines.append(f'  {day_str}  {v["calls"]:>3} Calls  ${v["cost"]:.4f}')
+
+        # Per-model breakdown
+        per_model = {}
+        for e in entries:
+            m = e.get('model', '?') or '?'
+            slot = per_model.setdefault(m, {'calls': 0, 'cost': 0.0})
+            slot['calls'] += 1
+            slot['cost'] += e.get('cost_usd', 0)
+        if len(per_model) > 1:
+            lines.append('')
+            lines.append('Pro Modell:')
+            for m, v in sorted(per_model.items(), key=lambda x: -x[1]['cost']):
+                lines.append(f'  {m:<20} {v["calls"]:>3} Calls  ${v["cost"]:.4f}')
+
+        # Per-user breakdown only when admin sees global view
+        if is_admin and not only_me:
+            per_user = {}
+            for e in entries:
+                u = e.get('user', '?') or '?'
+                slot = per_user.setdefault(u, {'calls': 0, 'cost': 0.0})
+                slot['calls'] += 1
+                slot['cost'] += e.get('cost_usd', 0)
+            if len(per_user) > 1:
+                lines.append('')
+                lines.append('Pro User:')
+                for u, v in sorted(per_user.items(), key=lambda x: -x[1]['cost']):
+                    lines.append(f'  {u:<15} {v["calls"]:>3} Calls  ${v["cost"]:.4f}')
+
         return '\n'.join(lines)
 
     def cmd_compact(self, session, args, room_token):
@@ -579,11 +1034,14 @@ class ClaudeBot:
             'Claude Bot Befehle:\n\n'
             '/clear - Neue Session starten\n'
             '/stop - Laufende Anfrage abbrechen\n'
-            '/model [name] - Modell anzeigen/wechseln (sonnet, opus, haiku)\n'
+            '/cancel - Wartende Nachrichten aus der Queue entfernen\n'
+            '/model [name] - Modell anzeigen/wechseln (sonnet, opus, opus4, opus47, haiku)\n'
             '/effort [level] - Effort-Level (low, medium, high, max)\n'
-            '/cost - Token-Verbrauch & Kosten anzeigen\n'
+            '/cost - Token-Verbrauch & Kosten anzeigen (aktuelle Session)\n'
+            '/usage [heute|gestern|Nd|YYYY-MM-DD|all] [me] - Token-Statistik aus dem Log\n'
             '/compact [fokus] - Kontext komprimieren\n'
             '/status - Session-Info\n'
+            '/transcribe - Naechste Sprachnachricht nur transkribieren (kein Claude, .txt im Chat)\n'
             '/help - Diese Hilfe\n\n'
             'Alle anderen Nachrichten werden an Claude Code weitergeleitet.\n'
             'Dateien & Sprachnachrichten werden ebenfalls verarbeitet.\n\n'
@@ -601,6 +1059,8 @@ class ClaudeBot:
 
         if cmd == '/clear':
             return self.cmd_clear(session)
+        elif cmd == '/cancel':
+            return self.cmd_cancel(session)
         elif cmd == '/stop':
             return self.cmd_stop(session)
         elif cmd == '/model':
@@ -609,16 +1069,20 @@ class ClaudeBot:
             return self.cmd_effort(session, parts[1:])
         elif cmd == '/cost':
             return self.cmd_cost(session)
+        elif cmd == '/usage':
+            return self.cmd_usage(parts[1:], user_id)
         elif cmd == '/compact':
             return self.cmd_compact(session, parts[1:], room_token)
         elif cmd == '/status':
             return self.cmd_status(session, user_id, room_token)
+        elif cmd == '/transcribe':
+            return self.cmd_transcribe(session)
         elif cmd == '/help':
             return self.cmd_help()
 
         return None
 
-    def handle_message(self, text, actor_id, room_token, temp_files=None):
+    def handle_message(self, text, actor_id, room_token, temp_files=None, is_voice=False):
         """Handle incoming NC Talk message from a specific room.
         temp_files: optional list of temp file paths to clean up after Claude is done.
         Returns response string for immediate replies (commands),
@@ -652,10 +1116,20 @@ class ClaudeBot:
         session.message_count += 1
         self.total_messages += 1
         queued = session.busy  # Already processing something?
-        session.queue.put((text, room_token, temp_files))
+        session.queue.put((text, room_token, temp_files, is_voice))
 
         if queued:
-            log.info(f'[{room_token}:{actor_id}] Queued (queue size: {session.queue.qsize()})')
+            qsize = session.queue.qsize()
+            log.info(f'[{room_token}:{actor_id}] Queued (queue size: {qsize})')
+            # Notify user that their message is queued
+            try:
+                self.nc.send_message(
+                    room_token,
+                    f'⏳ Vorherige Anfrage laeuft noch... deine Nachricht kommt danach dran (Position {qsize} in der Warteschlange).\n'
+                    f'Mit /cancel kannst du wartende Nachrichten entfernen.'
+                )
+            except Exception:
+                pass
         elif not session.status_msg_id:
             # Send immediate "thinking" feedback and track message ID for editing
             # Skip if status_msg_id already set (e.g. from voice transcription)
@@ -679,7 +1153,7 @@ class ClaudeBot:
         def _worker():
             while True:
                 try:
-                    text, room_token, temp_files = session.queue.get(timeout=1)
+                    text, room_token, temp_files, is_voice = session.queue.get(timeout=1)
                 except queue.Empty:
                     session._worker_running = False
                     session.busy = False
@@ -690,12 +1164,22 @@ class ClaudeBot:
                 if not session.status_msg_id:
                     try:
                         mid = self.nc.send_message(room_token, '💭 Claude denkt nach...')
-                        session.status_msg_id = mid
-                        session.status_room_token = room_token
+                        if mid:
+                            session.status_msg_id = mid
+                            session.status_room_token = room_token
+                        else:
+                            session.status_send_failed = True
                     except Exception:
-                        pass
+                        session.status_send_failed = True
                 try:
-                    response = self._call_claude(text, session, room_token)
+                    response = self._call_claude(text, session, room_token, is_voice=is_voice)
+                    if response is None:
+                        # Process killed (by /stop or crash) — clear status message
+                        if session.status_msg_id:
+                            try:
+                                self.nc.edit_message(session.status_room_token, session.status_msg_id, '🛑 Abgebrochen.')
+                            except Exception:
+                                pass
                     if response is not None:
                         # Check for poll in response
                         response, poll_question, poll_options = self._extract_poll(response)
@@ -704,13 +1188,33 @@ class ClaudeBot:
                         # Edit status message with the response, or send new if edit fails
                         sent = False
                         if response.strip():
-                            if session.status_msg_id:
-                                try:
-                                    sent = self.nc.edit_message(session.status_room_token, session.status_msg_id, response)
-                                except Exception:
-                                    pass
+                            if is_voice:
+                                tts_ok = self._send_voice_message(response, room_token)
+                                if tts_ok:
+                                    # Edit status indicator away (can't delete in NC Talk)
+                                    if session.status_msg_id:
+                                        try:
+                                            self.nc.edit_message(session.status_room_token, session.status_msg_id, '🔊')
+                                        except Exception:
+                                            pass
+                                    sent = True
                             if not sent:
-                                self.nc.send_message(room_token, response)
+                                if session.status_msg_id:
+                                    # Retry edit with progressively longer timeouts before falling back
+                                    for attempt_timeout in (30, 45, 60):
+                                        try:
+                                            sent = self.nc.edit_message(
+                                                session.status_room_token,
+                                                session.status_msg_id,
+                                                response,
+                                                timeout=attempt_timeout,
+                                            )
+                                        except Exception:
+                                            sent = False
+                                        if sent:
+                                            break
+                                if not sent:
+                                    self.nc.send_message(room_token, response, timeout=45)
                         elif session.status_msg_id:
                             # No text, only poll — delete status message by editing to minimal
                             try:
@@ -732,6 +1236,7 @@ class ClaudeBot:
                 finally:
                     session.status_msg_id = None
                     session.status_room_token = None
+                    session.status_send_failed = False
                     self._cleanup_temp_files(temp_files)
 
         thread = threading.Thread(target=_worker, daemon=True)
@@ -953,36 +1458,47 @@ class ClaudeBot:
                                 continue
 
                             if is_voice:
-                                # Voice/audio → transcribe, then send text to Claude
-                                transcription = self._transcribe_audio(local_path)
+                                session = self._get_session(actor_id, token)
+                                transcribe_only = session.transcribe_pending
+                                if transcribe_only:
+                                    session.transcribe_pending = False
+                                # Voice/audio → transcribe, then either share .txt (transcribe-only)
+                                # or pass to Claude as prompt.
+                                transcription = self._transcribe_audio(local_path, delete_after=False)
+                                try:
+                                    os.unlink(local_path)
+                                except Exception:
+                                    pass
                                 if not transcription:
                                     if status_mid:
                                         self.nc.edit_message(token, status_mid, 'Sprachnachricht konnte nicht transkribiert werden.')
                                     else:
                                         self.nc.send_message(token, 'Sprachnachricht konnte nicht transkribiert werden.')
                                     continue
-                                # Pass transcription status message to session so handle_message
-                                # reuses it instead of creating a new "thinking" message
+                                if transcribe_only:
+                                    ok = self._send_transcript_file(transcription, token, source_name=file_name)
+                                    if status_mid:
+                                        self.nc.edit_message(token, status_mid,
+                                            '📝 Transkript geteilt.' if ok else 'Transkript-Upload fehlgeschlagen.')
+                                    elif not ok:
+                                        self.nc.send_message(token, 'Transkript-Upload fehlgeschlagen.')
+                                    continue
+                                # Pass transcription status message to session so worker reuses it
                                 if status_mid:
-                                    session = self._get_session(actor_id, token)
                                     session.status_msg_id = status_mid
                                     session.status_room_token = token
                                 prompt = f'[Sprachnachricht]: {transcription}'
-                                response = self.handle_message(prompt, actor_id, token)
+                                self.handle_message(prompt, actor_id, token, is_voice=True)
                             else:
                                 # Image/PDF/other → download, tell Claude the path
                                 user_text = msg.get('message', '').strip()
-                                # Clean mention placeholders from accompanying text
                                 user_text = re.sub(r'\{file\}', '', user_text).strip()
                                 user_text = re.sub(r'\{mention-[^}]+\}', '', user_text).strip()
                                 if user_text:
                                     prompt = f'Der User hat eine Datei gesendet ({file_name}). Die Datei liegt unter: {local_path}\n\nNachricht des Users: {user_text}'
                                 else:
                                     prompt = f'Der User hat eine Datei gesendet ({file_name}). Bitte lies und analysiere die Datei: {local_path}'
-                                response = self.handle_message(prompt, actor_id, token, temp_files=[local_path])
-
-                            if response:
-                                self.nc.send_message(token, response)
+                                self.handle_message(prompt, actor_id, token, temp_files=[local_path])
                         except Exception as e:
                             log.error(f'File handling error from {actor_id} in {token}: {e}')
                         continue

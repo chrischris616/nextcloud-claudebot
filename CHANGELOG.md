@@ -1,5 +1,29 @@
 # Changelog
 
+## v2.1.6 (2026-04-30)
+
+### New Features
+- **Persistent token-usage logging + `/usage` command:** Every Claude CLI call is now appended as one JSON line to `bot/data/usage.jsonl` with timestamp, user, room, model, effort, input/output tokens, cache-read/cache-creation tokens, cost in USD, tool count, and call duration. The new `/usage` command renders any time window directly into the NC Talk chat:
+  - `/usage` — today
+  - `/usage gestern` — yesterday
+  - `/usage 7d`, `/usage 30d` — last N days
+  - `/usage 2026-04-30` — specific date
+  - `/usage all` — entire history
+  - Suffix `me` (e.g. `/usage 7d me`) restricts to the caller
+  - Output: total calls / cost / tools, token totals with cache-hit-rate, per-day breakdown for multi-day ranges, per-model split, and per-user split for admins
+  - **Privacy:** non-admin callers automatically see only their own entries; only `admin_users` from `config.json` see the global view
+
+### Bundled bot-side improvements (previously unreleased)
+- **stream-json output parsing:** the Claude CLI is now invoked with `--output-format stream-json --verbose`. The bot tails events live, displays the active tool (Read/Edit/Bash/Glob/Grep/etc.) and a rolling history of icons in the editable status message, and counts tool invocations.
+- **`/transcribe`:** mark the next voice message as transcribe-only — the bot uploads the `.txt` to NC instead of forwarding it to Claude.
+- **`/cancel`:** drop queued (not-yet-running) messages from the worker queue without killing the active call.
+- **Voice-message TTS reply (when triggered by a voice message):** Claude's response is converted to speech and posted as an audio file alongside the editable status indicator.
+- **Status-message hardening:** when a status `send_message` call genuinely fails (after the v2.1.5 NC Talk 400 workaround already recovers spurious failures), the worker now sets a `status_send_failed` flag and stops retrying inside the same call to avoid spam. Final-response delivery falls back through progressively longer edit timeouts (30s → 45s → 60s) before reverting to a fresh send.
+- **Voice transcription status reuse with longer cleanup grace period.**
+
+### Internal
+- New helpers: `_log_usage`, `_fmt_num`, `_tool_detail`, `TOOL_STATUS` mapping.
+
 ## v2.1.5 (2026-04-30)
 
 ### Bug Fixes
