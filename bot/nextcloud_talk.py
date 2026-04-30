@@ -8,6 +8,7 @@ import json
 import logging
 import threading
 import time
+import uuid
 from base64 import b64encode
 from http.client import HTTPSConnection
 from urllib.parse import urlparse, quote
@@ -37,23 +38,35 @@ class NextcloudTalkClient:
             'Content-Type': 'application/x-www-form-urlencoded',
         }
 
-    def _request(self, method, path, body=None, timeout=15):
+    def _request_raw(self, method, path, body=None, timeout=15):
+        """Low-level request. Returns (status_code, parsed_json_or_None).
+        status_code is None on connection errors.
+        """
         url = f'{self.base_path}{path}'
         try:
             conn = HTTPSConnection(self.host, self.port, timeout=timeout)
             conn.request(method, url, body=body, headers=self._headers)
             resp = conn.getresponse()
-            data = resp.read().decode()
+            raw = resp.read().decode()
             conn.close()
-            if resp.status in (200, 201):
-                return json.loads(data)
-            if resp.status == 304:
-                return None  # No new messages (expected for long-polling)
-            log.warning(f'NC Talk API {method} {path}: HTTP {resp.status}')
-            return None
+            try:
+                data = json.loads(raw) if raw else None
+            except json.JSONDecodeError:
+                data = None
+            return resp.status, data
         except Exception as e:
             log.error(f'NC Talk API error: {e}')
-            return None
+            return None, None
+
+    def _request(self, method, path, body=None, timeout=15):
+        status, data = self._request_raw(method, path, body=body, timeout=timeout)
+        if status in (200, 201):
+            return data
+        if status == 304:
+            return None  # No new messages (expected for long-polling)
+        if status is not None:
+            log.warning(f'NC Talk API {method} {path}: HTTP {status}')
+        return None
 
     def get_or_create_conversation(self):
         """Get or create a 1:1 conversation with the notify_user. Returns room token."""
@@ -70,16 +83,49 @@ class NextcloudTalkClient:
         log.error(f'Failed to create conversation with {self.notify_user}')
         return None
 
-    def send_message(self, room_token, message):
-        """Send a message to a specific room. Returns message ID (int) on success, None on failure."""
-        body = f'message={quote(message)}'
-        result = self._request(
+    def send_message(self, room_token, message, timeout=15):
+        """Send a message to a specific room. Returns message ID (int) on success, None on failure.
+
+        Workaround for NC Talk 22.x bug: POST sometimes returns HTTP 400 with
+        data.error="message" even though the message was delivered. We always
+        attach a referenceId we generate; on a 400 we re-fetch and recover the
+        message ID by referenceId so callers can still edit the message.
+        """
+        ref_id = uuid.uuid4().hex
+        body = f'message={quote(message)}&referenceId={ref_id}'
+        status, data = self._request_raw(
             'POST',
             f'/ocs/v2.php/apps/spreed/api/v1/chat/{room_token}',
             body=body,
+            timeout=timeout,
         )
-        if result:
-            return result.get('ocs', {}).get('data', {}).get('id')
+        if status in (200, 201) and data:
+            msg_id = data.get('ocs', {}).get('data', {}).get('id')
+            if msg_id:
+                return msg_id
+        # Recover from spurious 400: server rejected the parsed-message echo,
+        # but the message itself usually got through. Look it up by referenceId.
+        if status == 400 and data and data.get('ocs', {}).get('data', {}).get('error') == 'message':
+            recovered = self._find_message_by_reference(room_token, ref_id, timeout=timeout)
+            if recovered:
+                log.info(f'NC Talk: send returned 400 but message was delivered (room {room_token}, id {recovered})')
+                return recovered
+            log.warning(f'NC Talk POST chat/{room_token}: HTTP 400, message NOT recovered (ref {ref_id[:8]})')
+        elif status is not None and status not in (200, 201):
+            log.warning(f'NC Talk POST chat/{room_token}: HTTP {status}')
+        return None
+
+    def _find_message_by_reference(self, room_token, reference_id, timeout=10):
+        """Look up a recently sent message by referenceId. Returns int id or None."""
+        status, data = self._request_raw(
+            'GET',
+            f'/ocs/v2.php/apps/spreed/api/v1/chat/{room_token}?lookIntoFuture=0&limit=15',
+            timeout=timeout,
+        )
+        if status == 200 and data:
+            for m in data.get('ocs', {}).get('data', []):
+                if m.get('referenceId') == reference_id:
+                    return m.get('id')
         return None
 
     def create_poll(self, room_token, question, options, max_votes=1):
@@ -123,13 +169,14 @@ class NextcloudTalkClient:
             return result.get('ocs', {}).get('data')
         return None
 
-    def edit_message(self, room_token, message_id, new_message):
+    def edit_message(self, room_token, message_id, new_message, timeout=15):
         """Edit an existing message. Returns True on success."""
         body = f'message={quote(new_message)}'
         result = self._request(
             'PUT',
             f'/ocs/v2.php/apps/spreed/api/v1/chat/{room_token}/{message_id}',
             body=body,
+            timeout=timeout,
         )
         return result is not None
 
