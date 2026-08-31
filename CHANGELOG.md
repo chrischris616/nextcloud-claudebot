@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.1.7 (2026-08-31)
+
+### New Features
+- **`/status` now reports free disk space:** admins see a new "Freier Speicherplatz" line in the extended `/status` output, showing free vs. total disk space on the filesystem backing `claude.working_directory`.
+
 ## v2.1.6 (2026-04-30)
 
 ### New Features

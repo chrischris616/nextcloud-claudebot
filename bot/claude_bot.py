@@ -16,6 +16,7 @@ import re
 import time
 import logging
 import os
+import shutil
 import signal
 import sys
 import uuid
@@ -735,6 +736,14 @@ class ClaudeBot:
         session.model = model_aliases.get(new_model, new_model)
         return f'Modell gewechselt: {old_model} -> {session.model}'
 
+    @staticmethod
+    def _format_bytes(num_bytes):
+        size = float(num_bytes)
+        for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+            if size < 1024 or unit == 'TB':
+                return f'{size:.1f} {unit}'
+            size /= 1024
+
     def cmd_status(self, session, user_id, room_token=None):
         uptime = datetime.now() - self.start_time
         hours, remainder = divmod(int(uptime.total_seconds()), 3600)
@@ -766,6 +775,7 @@ class ClaudeBot:
 
         if user_id in self.admin_users:
             unique_users = len(set(uid for (rt, uid) in self.sessions))
+            disk = shutil.disk_usage(self.working_directory)
             lines.extend([
                 f'---',
                 f'Bot-Uptime: {uptime_str}',
@@ -774,6 +784,7 @@ class ClaudeBot:
                 f'Gesamt-Nachrichten: {self.total_messages}',
                 f'Ueberwachte Raeume: {len(self.rooms)}',
                 f'Arbeitsverzeichnis: {self.working_directory}',
+                f'Freier Speicherplatz: {self._format_bytes(disk.free)} von {self._format_bytes(disk.total)}',
             ])
 
         return '\n'.join(lines)
